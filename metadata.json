@@ -1,0 +1,10 @@
+{
+  "name": "AOL Live Hindi Translator",
+  "description": "Real-time English-to-Hindi speech translation and live audio broadcast for Art of Living classroom sessions, delivering Hindi audio and subtitles to student phones.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

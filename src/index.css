@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@theme {
+  --font-hindi: 'Yantramanav', system-ui, sans-serif;
+  --font-spiritual: 'Rozha One', serif;
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #0c0a09;
+  color: #f5f5f4;
+  overflow-x: hidden;
+}
+
+.font-hindi {
+  font-family: var(--font-hindi);
+}
+
+.font-spiritual {
+  font-family: var(--font-spiritual);
+}
+
+/* Audio wave animation */
+@keyframes soundwave {
+  0%, 100% { height: 6px; }
+  50% { height: 28px; }
+}
+
+.wave-bar {
+  animation: soundwave 1.2s ease-in-out infinite;
+}
