@@ -18,7 +18,7 @@ export default function App() {
     const roleParam = params.get('role');
 
     if (sessionParam) {
-      setSessionId(sessionParam);
+      setSessionId(sessionParam.trim().toUpperCase());
       // If someone arrived via a session link without explicitly specifying role=teacher, default to student
       if (roleParam === 'teacher') {
         setRole('teacher');

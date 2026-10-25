@@ -44,10 +44,10 @@ export const StudentView: React.FC<Props> = ({
   const [studentCount, setStudentCount] = useState(1);
   const [studentId] = useState(() => `student-${studentIndex}-${Math.random().toString(36).substring(2, 6)}`);
 
-  // Audio player state
+  // Audio player state - in lab simulator, mute students 2-4 by default to avoid computer speaker echo
   const [audioUnlocked, setAudioUnlocked] = useState(false);
-  const [volume, setVolume] = useState(0.85);
-  const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolume] = useState(() => (isSimulated && studentIndex > 1 ? 0 : 0.85));
+  const [isMuted, setIsMuted] = useState(() => (isSimulated && studentIndex > 1));
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [isTestingAudio, setIsTestingAudio] = useState(false);
@@ -63,15 +63,33 @@ export const StudentView: React.FC<Props> = ({
 
   // Initialize AudioPlayer
   useEffect(() => {
-    const player = new StudentAudioPlayer((playing) => {
-      setIsPlayingAudio(playing);
-    });
+    const player = new StudentAudioPlayer(
+      (playing) => {
+        setIsPlayingAudio(playing);
+      },
+      (err) => {
+        setErrorMessage(err);
+      }
+    );
     audioPlayerRef.current = player;
 
     return () => {
       player.close();
     };
   }, []);
+
+  // Monitor audio context suspension in mobile browsers
+  useEffect(() => {
+    const checkTimer = setInterval(() => {
+      if (audioPlayerRef.current) {
+        const isRunning = audioPlayerRef.current.getUnlocked();
+        if (audioUnlocked && !isRunning) {
+          setAudioUnlocked(false);
+        }
+      }
+    }, 1500);
+    return () => clearInterval(checkTimer);
+  }, [audioUnlocked]);
 
   // Update volume in player
   useEffect(() => {
@@ -92,9 +110,10 @@ export const StudentView: React.FC<Props> = ({
     subtitleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [subtitles]);
 
-  // Connect WebSocket
+  // Connect WebSocket with auto-ping and background fallback
   useEffect(() => {
     let reconnectTimeout: any = null;
+    let pingInterval: any = null;
     let isCancelled = false;
 
     const connectWs = () => {
@@ -102,8 +121,9 @@ export const StudentView: React.FC<Props> = ({
       setConnectionStatus('connecting');
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const cleanSessionId = (sessionId || 'AOL-108').trim().toUpperCase();
       const wsUrl = `${protocol}//${window.location.host}/ws?role=student&sessionId=${encodeURIComponent(
-        sessionId
+        cleanSessionId
       )}&studentId=${encodeURIComponent(studentId)}&studentName=Student+${studentIndex}`;
 
       try {
@@ -133,15 +153,29 @@ export const StudentView: React.FC<Props> = ({
             } else if (data.type === 'TRANSLATION_BROADCAST') {
               const newSub: SubtitleItem = data.subtitle;
               if (newSub) {
+                setIsTeacherLive(true);
+                setTeacherConnected(true);
                 setSubtitles((prev) => {
                   const filtered = prev.filter((s) => s.id !== newSub.id);
                   return [...filtered, newSub];
                 });
 
-                // Play audio if student enabled audio
-                if (audioEnabled && audioPlayerRef.current) {
+                // Play audio if student enabled audio and audioBase64 was pre-attached
+                if (data.audioBase64 && audioEnabled && audioPlayerRef.current) {
                   audioPlayerRef.current.queueAudio(data.audioBase64, newSub.hindi);
                 }
+              }
+            } else if (data.type === 'AUDIO_CHUNK_BROADCAST') {
+              // Asynchronous Hindi TTS audio stream arrived (with text fallback)
+              if (data.ttsSuccess === false || (!data.audioBase64 && data.ttsError)) {
+                setErrorMessage(data.ttsError || 'ध्वनि निर्माण में समस्या: केवल सबटाइटल उपलब्ध (Audio unavailable, showing subtitles)');
+              } else if (data.audioBase64) {
+                // If previous message was an audio error, clear it now that audio arrived
+                setErrorMessage((prev) => (prev && prev.includes('ध्वनि') ? null : prev));
+              }
+
+              if (audioEnabled && audioPlayerRef.current) {
+                audioPlayerRef.current.queueAudio(data.audioBase64, data.hindiText);
               }
             } else if (data.type === 'SESSION_LIVE_STATE') {
               setIsTeacherLive(!!data.isLive);
@@ -161,7 +195,7 @@ export const StudentView: React.FC<Props> = ({
         ws.onerror = (e) => {
           console.warn('Student WS error:', e);
           setConnectionStatus('error');
-          setErrorMessage('Connection issue detected. Reconnecting automatically...');
+          setErrorMessage('कनेक्शन बाधित हुआ। पुनः कनेक्ट हो रहा है... (Connection interrupted. Reconnecting...)');
         };
 
         ws.onclose = () => {
@@ -178,9 +212,43 @@ export const StudentView: React.FC<Props> = ({
 
     connectWs();
 
+    // Ping every 20 seconds to keep connection alive
+    pingInterval = setInterval(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'PING' }));
+      }
+    }, 20000);
+
+    // Periodic fallback poll every 4 seconds to guarantee subtitles stay synced
+    const fallbackPollInterval = setInterval(async () => {
+      try {
+        const cleanSessionId = (sessionId || 'AOL-108').trim().toUpperCase();
+        const res = await fetch(`/api/sessions/${encodeURIComponent(cleanSessionId)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.isLive !== undefined) setIsTeacherLive(!!data.isLive);
+          if (data.isMuted !== undefined) setIsTeacherMuted(!!data.isMuted);
+          if (Array.isArray(data.subtitles) && data.subtitles.length > 0) {
+            setSubtitles((prev) => {
+              const prevIds = new Set(prev.map((s) => s.id));
+              const newItems = data.subtitles.filter((s: SubtitleItem) => !prevIds.has(s.id));
+              if (newItems.length > 0) {
+                return [...prev, ...newItems];
+              }
+              return prev;
+            });
+          }
+        }
+      } catch (e) {
+        // Silent fallback failure
+      }
+    }, 4000);
+
     return () => {
       isCancelled = true;
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (pingInterval) clearInterval(pingInterval);
+      clearInterval(fallbackPollInterval);
       if (wsRef.current) {
         wsRef.current.close();
       }
@@ -193,8 +261,6 @@ export const StudentView: React.FC<Props> = ({
       const ok = await audioPlayerRef.current.unlock();
       if (ok) {
         setAudioUnlocked(true);
-        // Play short chime or test greeting
-        handleTestAudio();
       }
     }
   };
@@ -228,7 +294,14 @@ export const StudentView: React.FC<Props> = ({
   }[fontSize];
 
   return (
-    <div className="flex flex-col h-full bg-stone-950 text-stone-100 select-none">
+    <div
+      onClick={() => {
+        if (!audioPlayerRef.current?.getUnlocked()) {
+          handleUnlockAudio();
+        }
+      }}
+      className="flex flex-col h-full bg-stone-950 text-stone-100 select-none cursor-pointer sm:cursor-default"
+    >
       {/* Top Mobile App Bar */}
       <header className="px-4 py-3 bg-stone-900/90 border-b border-stone-800/80 backdrop-blur-md flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2.5">
@@ -262,7 +335,10 @@ export const StudentView: React.FC<Props> = ({
         {/* Action icons */}
         <div className="flex items-center gap-1.5">
           <button
-            onClick={() => setShowEnglish(!showEnglish)}
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowEnglish(!showEnglish);
+            }}
             className={`p-2 rounded-lg text-xs font-medium transition flex items-center gap-1 border ${
               showEnglish
                 ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
@@ -276,7 +352,8 @@ export const StudentView: React.FC<Props> = ({
           </button>
 
           <button
-            onClick={() => {
+            onClick={(e) => {
+              e.stopPropagation();
               setFontSize((prev) => (prev === 'normal' ? 'large' : prev === 'large' ? 'xlarge' : 'normal'));
             }}
             className="p-2 rounded-lg bg-stone-800/80 hover:bg-stone-700/80 text-stone-300 border border-stone-700 transition"
@@ -287,7 +364,10 @@ export const StudentView: React.FC<Props> = ({
           </button>
 
           <button
-            onClick={onOpenGuide}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenGuide();
+            }}
             className="p-2 rounded-lg bg-stone-800/80 hover:bg-stone-700/80 text-stone-300 border border-stone-700 transition"
             title="Setup Help"
             aria-label="Help"
@@ -296,6 +376,25 @@ export const StudentView: React.FC<Props> = ({
           </button>
         </div>
       </header>
+
+      {/* Connection Notice / Error Banner */}
+      {errorMessage && (
+        <div className="px-4 py-2.5 bg-red-950/90 border-b border-red-500/40 text-red-200 text-xs flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setErrorMessage(null);
+            }}
+            className="text-[10px] font-bold text-red-300 hover:text-white uppercase tracking-wider ml-2 shrink-0"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Classroom Status Ribbon */}
       <div className="px-4 py-2 bg-stone-900/60 border-b border-stone-800/50 flex items-center justify-between text-xs">
@@ -322,7 +421,9 @@ export const StudentView: React.FC<Props> = ({
         {/* Earphone audio indicator */}
         <div className="flex items-center gap-1.5">
           <Headphones className="w-3.5 h-3.5 text-amber-400" />
-          <span className="text-[11px] text-stone-300">ईयरफ़ोन अनुशंसित</span>
+          <span className="text-[11px] text-stone-300">
+            {audioUnlocked ? 'ईयरफ़ोन सक्रिय ✓' : 'ईयरफ़ोन अनुशंसित'}
+          </span>
         </div>
       </div>
 
@@ -452,7 +553,12 @@ export const StudentView: React.FC<Props> = ({
                 if (!audioUnlocked) {
                   handleUnlockAudio();
                 } else {
-                  setIsMuted(!isMuted);
+                  if (isMuted) {
+                    setIsMuted(false);
+                    if (volume === 0) setVolume(0.85);
+                  } else {
+                    setIsMuted(true);
+                  }
                 }
               }}
               className={`p-2.5 rounded-xl flex items-center gap-2 text-xs font-semibold border transition ${
@@ -483,13 +589,19 @@ export const StudentView: React.FC<Props> = ({
               min="0"
               max="1"
               step="0.05"
-              value={volume}
-              onChange={(e) => setVolume(parseFloat(e.target.value))}
+              value={isMuted ? 0 : volume}
+              onChange={(e) => {
+                const newVol = parseFloat(e.target.value);
+                setVolume(newVol);
+                if (newVol > 0 && isMuted) {
+                  setIsMuted(false);
+                }
+              }}
               className="w-full h-1.5 bg-stone-800 rounded-lg appearance-none cursor-pointer accent-amber-500"
               aria-label="Student volume control"
             />
             <span className="text-[11px] text-stone-400 font-mono w-9 text-right shrink-0">
-              {Math.round(volume * 100)}%
+              {isMuted ? '0%' : `${Math.round(volume * 100)}%`}
             </span>
           </div>
         </div>

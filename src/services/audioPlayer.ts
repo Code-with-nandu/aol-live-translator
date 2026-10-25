@@ -13,9 +13,14 @@ export class StudentAudioPlayer {
   private isPlaying: boolean = false;
   private currentSource: AudioBufferSourceNode | null = null;
   private onPlayStateChange?: (playing: boolean) => void;
+  private onError?: (error: string) => void;
 
-  constructor(onPlayStateChange?: (playing: boolean) => void) {
+  constructor(
+    onPlayStateChange?: (playing: boolean) => void,
+    onError?: (error: string) => void
+  ) {
     this.onPlayStateChange = onPlayStateChange;
+    this.onError = onError;
   }
 
   public async unlock(): Promise<boolean> {
@@ -40,6 +45,12 @@ export class StudentAudioPlayer {
       source.start(0);
 
       this.isUnlocked = true;
+
+      // Immediately process any queued audio that arrived before unlock
+      if (!this.isPlaying && this.queue.length > 0) {
+        this.playNext();
+      }
+
       return true;
     } catch (err) {
       console.warn('AudioContext unlock failed:', err);
@@ -75,8 +86,8 @@ export class StudentAudioPlayer {
 
   public queueAudio(base64Audio?: string, textFallback?: string) {
     if (!this.isUnlocked) {
-      // If not unlocked yet, we store up to 3 latest items
-      if (this.queue.length > 3) this.queue.shift();
+      // Store latest queued items until user taps to enable audio
+      if (this.queue.length >= 4) this.queue.shift();
       this.queue.push({ base64Audio, textFallback });
       return;
     }
@@ -100,45 +111,81 @@ export class StudentAudioPlayer {
     this.isPlaying = true;
     this.onPlayStateChange?.(true);
 
+    let played = false;
+
     if (item.base64Audio) {
       try {
-        await this.playBase64Wav(item.base64Audio);
-      } catch (err) {
-        console.warn('Failed to decode base64 audio, trying speech synthesis fallback:', err);
-        if (item.textFallback) {
-          await this.playSpeechSynthesis(item.textFallback);
-        }
+        await this.playBase64Audio(item.base64Audio);
+        played = true;
+      } catch (err: any) {
+        console.warn('Failed to decode/play base64 audio:', err?.message || err);
       }
-    } else if (item.textFallback) {
-      await this.playSpeechSynthesis(item.textFallback);
     }
 
-    // Short gap between phrases
+    if (!played && item.textFallback) {
+      try {
+        await this.playSpeechSynthesis(item.textFallback);
+        played = true;
+      } catch (err) {
+        console.warn('SpeechSynthesis fallback error:', err);
+      }
+    }
+
+    if (!played) {
+      this.onError?.('ध्वनि चलाने में असमर्थ (Failed to decode or play audio chunk)');
+    }
+
+    // Short calm gap between phrases (150ms)
     setTimeout(() => {
       this.playNext();
     }, 150);
   }
 
-  private async playBase64Wav(base64: string): Promise<void> {
+  private async playBase64Audio(base64: string): Promise<void> {
     if (!this.ctx || !this.gainNode) {
       await this.unlock();
     }
-    if (!this.ctx || !this.gainNode) return;
-
-    if (this.ctx.state === 'suspended') {
-      await this.ctx.resume();
+    if (!this.ctx || !this.gainNode) {
+      throw new Error('AudioContext unavailable');
     }
 
-    // Convert base64 to ArrayBuffer
-    const binaryString = atob(base64);
+    if (this.ctx.state === 'suspended') {
+      try {
+        await this.ctx.resume();
+      } catch (e) {
+        // May require user gesture on mobile
+      }
+      if (this.ctx.state === 'suspended') {
+        this.onError?.('ब्राउज़र ने ऑडियो रोक रखा है। सुनने के लिए स्क्रीन पर टैप करें (Audio suspended by browser - tap anywhere to resume)');
+      }
+    }
+
+    // Strip any data URI prefix (e.g. data:audio/wav;base64,) and whitespace
+    const cleanBase64 = base64.replace(/^data:audio\/[^;]+;base64,/, '').replace(/\s+/g, '');
+    const binaryString = atob(cleanBase64);
     const len = binaryString.length;
     const bytes = new Uint8Array(len);
     for (let i = 0; i < len; i++) {
       bytes[i] = binaryString.charCodeAt(i);
     }
 
-    // Decode audio buffer (WAV)
-    const audioBuffer = await this.ctx.decodeAudioData(bytes.buffer.slice(0));
+    // Decode audio buffer (handles both WAV and MP3 natively) with timeout protection
+    const decodePromise = new Promise<AudioBuffer>((resolve, reject) => {
+      const res = this.ctx!.decodeAudioData(
+        bytes.buffer.slice(0),
+        (buf) => resolve(buf),
+        (err) => reject(err)
+      );
+      if (res && typeof (res as any).then === 'function') {
+        (res as any).then(resolve).catch(reject);
+      }
+    });
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Audio decode timed out')), 5000)
+    );
+
+    const audioBuffer = await Promise.race([decodePromise, timeoutPromise]);
 
     return new Promise((resolve) => {
       if (!this.ctx || !this.gainNode) {
@@ -150,10 +197,20 @@ export class StudentAudioPlayer {
       source.connect(this.gainNode);
       this.currentSource = source;
 
-      source.onended = () => {
-        this.currentSource = null;
-        resolve();
+      let hasFinished = false;
+      const finish = () => {
+        if (!hasFinished) {
+          hasFinished = true;
+          this.currentSource = null;
+          resolve();
+        }
       };
+
+      source.onended = finish;
+
+      // Safety timeout: in case mobile device suspends onended event
+      const maxDurationMs = Math.max(800, audioBuffer.duration * 1000 + 1200);
+      setTimeout(finish, maxDurationMs);
 
       source.start();
     });
@@ -169,7 +226,7 @@ export class StudentAudioPlayer {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(hindiText);
       utterance.lang = 'hi-IN';
-      utterance.rate = 0.95; // Slightly slower, calm pace for meditation
+      utterance.rate = 0.92; // Slightly slower, calm pace for spiritual meditation
       utterance.pitch = 1.0;
       utterance.volume = this.isMuted ? 0 : this.volume;
 
@@ -180,8 +237,19 @@ export class StudentAudioPlayer {
         utterance.voice = hindiVoice;
       }
 
-      utterance.onend = () => resolve();
-      utterance.onerror = () => resolve();
+      let done = false;
+      const finish = () => {
+        if (!done) {
+          done = true;
+          resolve();
+        }
+      };
+
+      utterance.onend = finish;
+      utterance.onerror = finish;
+
+      // Safety timeout: speech synthesis can occasionally hang on mobile Android
+      setTimeout(finish, 8000);
 
       window.speechSynthesis.speak(utterance);
     });

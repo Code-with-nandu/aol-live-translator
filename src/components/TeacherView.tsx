@@ -106,8 +106,71 @@ export const TeacherView: React.FC<Props> = ({ sessionId, onOpenGuide, onOpenSim
 
   const recognizerRef = useRef<TeacherSpeechRecognizer | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const categoryRef = useRef(category);
+  const phraseQueueRef = useRef<string[]>([]);
+  const isProcessingQueueRef = useRef(false);
+  const lastSpokenPhraseRef = useRef<{ text: string; time: number }>({ text: '', time: 0 });
 
-  // Initialize Speech Recognizer
+  useEffect(() => {
+    categoryRef.current = category;
+  }, [category]);
+
+  // Process phrase queue sequentially to prevent dropping teacher speech
+  const processPhraseQueue = async () => {
+    if (isProcessingQueueRef.current || phraseQueueRef.current.length === 0) return;
+    isProcessingQueueRef.current = true;
+    setIsProcessing(true);
+
+    while (phraseQueueRef.current.length > 0) {
+      const englishText = phraseQueueRef.current.shift();
+      if (!englishText) continue;
+
+      try {
+        const res = await fetch('/api/translate-and-broadcast', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            englishText,
+            category: categoryRef.current,
+          }),
+        });
+
+        const data = await res.json();
+        if (data.error) {
+          throw new Error(data.error);
+        }
+
+        if (data.subtitle) {
+          setRecentSubtitles((prev) => [...prev.filter((s) => s.id !== data.subtitle.id), data.subtitle]);
+        }
+      } catch (err: any) {
+        console.error('Translation broadcast error:', err);
+        setErrorMessage(err.message || 'Failed to translate and broadcast speech.');
+      }
+    }
+
+    isProcessingQueueRef.current = false;
+    setIsProcessing(false);
+  };
+
+  // Broadcast spoken phrase or typed phrase to all students via Gemini
+  const handleBroadcastPhrase = (englishText: string) => {
+    if (!englishText || !englishText.trim()) return;
+    const trimmed = englishText.trim();
+
+    // Prevent immediate duplicate firing from speech recognizer within 2.5 seconds
+    const now = Date.now();
+    if (lastSpokenPhraseRef.current.text === trimmed && (now - lastSpokenPhraseRef.current.time) < 2500) {
+      return;
+    }
+    lastSpokenPhraseRef.current = { text: trimmed, time: now };
+
+    phraseQueueRef.current.push(trimmed);
+    processPhraseQueue();
+  };
+
+  // Initialize Speech Recognizer once
   useEffect(() => {
     const recognizer = new TeacherSpeechRecognizer({
       onTranscript: (text, isFinal) => {
@@ -139,52 +202,95 @@ export const TeacherView: React.FC<Props> = ({ sessionId, onOpenGuide, onOpenSim
     return () => {
       recognizer.stop();
     };
-  }, [category]);
+  }, []);
 
-  // Connect WebSocket as Teacher
+  // Connect WebSocket as Teacher with auto-ping and auto-reconnect
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws?role=teacher&sessionId=${encodeURIComponent(sessionId)}`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    let reconnectTimeout: any = null;
+    let pingInterval: any = null;
+    let isCancelled = false;
 
-    ws.onopen = () => {
-      console.log('Teacher WS connected');
-    };
+    const connectTeacherWs = () => {
+      if (isCancelled) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const cleanSessionId = (sessionId || 'AOL-108').trim().toUpperCase();
+      const wsUrl = `${protocol}//${window.location.host}/ws?role=teacher&sessionId=${encodeURIComponent(cleanSessionId)}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'INIT_TEACHER') {
-          setIsLive(!!data.isLive);
-          setIsMuted(!!data.isMuted);
-          if (Array.isArray(data.students)) setStudentList(data.students);
-          if (Array.isArray(data.subtitles)) setRecentSubtitles(data.subtitles);
-        } else if (data.type === 'STUDENTS_UPDATED') {
-          if (Array.isArray(data.students)) setStudentList(data.students);
-        } else if (data.type === 'TRANSLATION_CONFIRMED') {
-          if (data.subtitle) {
-            setRecentSubtitles((prev) => [...prev.filter((s) => s.id !== data.subtitle.id), data.subtitle]);
-          }
+      ws.onopen = () => {
+        if (isCancelled) return;
+        console.log('Teacher WS connected to room:', cleanSessionId);
+        // If session was set live in component state, ensure server knows
+        if (isLive) {
+          ws.send(JSON.stringify({ type: 'SET_LIVE', isLive: true }));
         }
-      } catch (err) {
-        console.error('Error parsing teacher WS message:', err);
-      }
+      };
+
+      ws.onmessage = (event) => {
+        if (isCancelled) return;
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'INIT_TEACHER') {
+            setIsLive(!!data.isLive);
+            setIsMuted(!!data.isMuted);
+            if (Array.isArray(data.students)) setStudentList(data.students);
+            if (Array.isArray(data.subtitles)) setRecentSubtitles(data.subtitles);
+          } else if (data.type === 'STUDENTS_UPDATED') {
+            if (Array.isArray(data.students)) setStudentList(data.students);
+          } else if (data.type === 'TRANSLATION_CONFIRMED') {
+            if (data.subtitle) {
+              setRecentSubtitles((prev) => [...prev.filter((s) => s.id !== data.subtitle.id), data.subtitle]);
+            }
+          } else if (data.type === 'TTS_WARNING') {
+            setErrorMessage(`Audio Notice: ${data.message || 'Hindi TTS audio generation warning'}`);
+          }
+        } catch (err) {
+          console.error('Error parsing teacher WS message:', err);
+        }
+      };
+
+      ws.onclose = () => {
+        if (isCancelled) return;
+        reconnectTimeout = setTimeout(connectTeacherWs, 2500);
+      };
+
+      ws.onerror = (e) => {
+        console.warn('Teacher WS error:', e);
+      };
     };
+
+    connectTeacherWs();
+
+    pingInterval = setInterval(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'PING' }));
+      }
+    }, 20000);
 
     return () => {
-      ws.close();
+      isCancelled = true;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (pingInterval) clearInterval(pingInterval);
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
     };
   }, [sessionId]);
 
-  // Load session metadata & QR Code
+  // Load session metadata & QR Code using public origin
   useEffect(() => {
     const loadSession = async () => {
       try {
+        const cleanSessionId = (sessionId || 'AOL-108').trim().toUpperCase();
         const res = await fetch(`/api/sessions/create`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ customId: sessionId, category }),
+          body: JSON.stringify({
+            customId: cleanSessionId,
+            category,
+            origin: window.location.origin,
+          }),
         });
         const data = await res.json();
         if (data.joinUrl) setJoinUrl(data.joinUrl);
@@ -237,41 +343,6 @@ export const TeacherView: React.FC<Props> = ({ sessionId, onOpenGuide, onOpenSim
       } else if (isLive) {
         recognizerRef.current.start();
       }
-    }
-  };
-
-  // Broadcast spoken phrase or typed phrase to all students via Gemini
-  const handleBroadcastPhrase = async (englishText: string) => {
-    if (!englishText || !englishText.trim() || isProcessing) return;
-
-    setIsProcessing(true);
-    setErrorMessage(null);
-
-    try {
-      const res = await fetch('/api/translate-and-broadcast', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          englishText: englishText.trim(),
-          category,
-        }),
-      });
-
-      const data = await res.json();
-      if (data.error) {
-        throw new Error(data.error);
-      }
-
-      if (data.subtitle) {
-        setRecentSubtitles((prev) => [...prev.filter((s) => s.id !== data.subtitle.id), data.subtitle]);
-      }
-      setManualText('');
-    } catch (err: any) {
-      console.error('Translation failed:', err);
-      setErrorMessage(err.message || 'Failed to translate and broadcast speech.');
-    } finally {
-      setIsProcessing(false);
     }
   };
 

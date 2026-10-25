@@ -13,11 +13,27 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.set('trust proxy', true);
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
+
+function getBaseUrl(req: Request): string {
+  if (req.body?.origin && typeof req.body.origin === 'string' && req.body.origin.startsWith('http')) {
+    return req.body.origin.replace(/\/$/, '');
+  }
+  if (process.env.APP_URL) {
+    return process.env.APP_URL.replace(/\/$/, '');
+  }
+  const forwardedHost = req.headers['x-forwarded-host'] as string;
+  const forwardedProto = (req.headers['x-forwarded-proto'] as string) || 'https';
+  if (forwardedHost) {
+    return `${forwardedProto}://${forwardedHost}`;
+  }
+  return `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
+}
 
 // Initialize Gemini Client
 const ai = new GoogleGenAI({
@@ -89,63 +105,122 @@ Translation Guidelines:
 4. Output STRICTLY the Hindi translation text only. No preamble, no quotes, no English notes.`;
 }
 
-// Generate Hindi TTS audio buffer using Gemini TTS
-async function generateHindiAudio(text: string): Promise<string | null> {
-  if (!process.env.GEMINI_API_KEY) {
-    return null;
-  }
+// Fallback high-availability Hindi TTS endpoint (zero-quota interruption protection)
+async function generateFallbackHindiAudio(text: string): Promise<string | null> {
   try {
-    const ttsRes = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: text.trim(),
-              speechMetadata: {
-                style: 'Calm, gentle, meditative, warm spiritual guide speaking fluent Hindi',
-              },
-            },
-          ],
-        },
-      ],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: 'Kore' },
-          },
-        },
+    const cleanText = text.trim();
+    if (!cleanText) return null;
+    const truncated = cleanText.length > 200 ? cleanText.substring(0, 195) + '...' : cleanText;
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=hi&client=tw-ob&q=${encodeURIComponent(truncated)}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       },
     });
-
-    const audioBase64 = ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    return audioBase64 || null;
+    if (!res.ok) {
+      console.warn('Fallback Google TTS response status:', res.status);
+      return null;
+    }
+    const arrayBuf = await res.arrayBuffer();
+    if (arrayBuf.byteLength === 0) return null;
+    return Buffer.from(arrayBuf).toString('base64');
   } catch (err: any) {
-    console.error('Gemini TTS error:', err?.message || err);
+    console.warn('Fallback Google TTS error:', err?.message || err);
     return null;
   }
 }
 
-// Translate English text to Hindi with Gemini
+// Generate Hindi TTS audio buffer using Gemini TTS with cascading fallback
+async function generateHindiAudio(text: string): Promise<string | null> {
+  const cleanText = text.trim();
+  if (!cleanText) return null;
+
+  // Candidate models: gemini-3.8-flash-tts is the primary full-featured TTS model, followed by gemini-3.8-flash-lite-tts
+  const ttsCandidateModels = ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
+
+  if (process.env.GEMINI_API_KEY) {
+    for (const model of ttsCandidateModels) {
+      try {
+        const ttsRes = await ai.models.generateContent({
+          model,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: cleanText,
+                  speechMetadata: {
+                    style: 'Calm, gentle, meditative, warm spiritual guide speaking fluent Hindi',
+                  },
+                },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: 'Kore' },
+              },
+            },
+          },
+        });
+
+        const audioBase64 = ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (audioBase64) {
+          return audioBase64;
+        }
+      } catch (err: any) {
+        console.warn(`Gemini TTS model ${model} error, trying next fallback:`, err?.message || err);
+      }
+    }
+  }
+
+  // Resilient third-tier fallback: high-availability HTTP Hindi TTS stream
+  console.log('Attempting high-availability Hindi TTS fallback for:', cleanText);
+  const fallbackAudio = await generateFallbackHindiAudio(cleanText);
+  if (fallbackAudio) {
+    return fallbackAudio;
+  }
+
+  return null;
+}
+
+// Translate English text to Hindi with Gemini (ultra-fast latency with resilient fallback)
 async function translateEnglishToHindi(englishText: string, category: string = 'general'): Promise<string> {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
 
   const prompt = `Translate this teacher's speech segment to Hindi:\n"${englishText.trim()}"`;
+  const systemInstruction = getSystemInstruction(category);
 
-  const res = await ai.models.generateContent({
-    model: 'gemini-3.8-flash',
-    contents: prompt,
-    config: {
-      systemInstruction: getSystemInstruction(category),
-      temperature: 0.2,
-    },
-  });
+  // Supported models to try: gemini-3.1-flash-lite (fastest, zero thinking latency), then gemini-flash-latest, then gemini-3.8-flash
+  const candidateModels = ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
+  let lastError: any = null;
 
-  return (res.text || '').trim();
+  for (const model of candidateModels) {
+    try {
+      const res = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          temperature: 0.2,
+        },
+      });
+
+      const text = (res.text || '').trim();
+      if (text) {
+        return text;
+      }
+    } catch (err: any) {
+      console.warn(`Model ${model} translation error, trying fallback:`, err?.message || err);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('All translation models failed');
 }
 
 // Pre-create a default room if not existing
@@ -222,10 +297,9 @@ app.post('/api/sessions/create', async (req: Request, res: Response) => {
     const sessionId = customId?.trim() || `AOL-${Math.floor(1000 + Math.random() * 9000)}`;
     const session = getOrCreateSession(sessionId, title, category);
 
-    // Determine host URL for QR code
-    const host = req.get('host') || 'localhost:3000';
-    const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
-    const joinUrl = `${protocol}://${host}/?session=${encodeURIComponent(sessionId)}`;
+    // Determine public host URL for QR code and student join link
+    const baseUrl = getBaseUrl(req);
+    const joinUrl = `${baseUrl}/?session=${encodeURIComponent(sessionId)}`;
 
     const qrDataUrl = await QRCode.toDataURL(joinUrl, {
       width: 320,
@@ -251,15 +325,11 @@ app.post('/api/sessions/create', async (req: Request, res: Response) => {
 
 // Get session details
 app.get('/api/sessions/:id', async (req: Request, res: Response) => {
-  const sessionId = req.params.id;
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
+  const normId = (req.params.id || 'AOL-108').trim().toUpperCase();
+  const session = getOrCreateSession(normId);
 
-  const host = req.get('host') || 'localhost:3000';
-  const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
-  const joinUrl = `${protocol}://${host}/?session=${encodeURIComponent(sessionId)}`;
+  const baseUrl = getBaseUrl(req);
+  const joinUrl = `${baseUrl}/?session=${encodeURIComponent(session.id)}`;
   const qrDataUrl = await QRCode.toDataURL(joinUrl, {
     width: 300,
     margin: 2,
@@ -291,14 +361,12 @@ app.post('/api/translate-and-broadcast', async (req: Request, res: Response) => 
       return res.status(400).json({ error: 'englishText is required' });
     }
 
-    const session = getOrCreateSession(sessionId || 'AOL-DEFAULT');
+    const normId = (sessionId || 'AOL-108').trim().toUpperCase();
+    const session = getOrCreateSession(normId);
     const chosenCategory = category || session.category || 'general';
 
-    // 1. Translate with Gemini
+    // 1. Translate with Gemini (~1s)
     const hindiTranslation = await translateEnglishToHindi(englishText, chosenCategory);
-
-    // 2. Synthesize audio with Gemini TTS
-    const audioBase64 = await generateHindiAudio(hindiTranslation);
 
     const subtitleItem: SubtitleItem = {
       id: `sub-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
@@ -313,21 +381,65 @@ app.post('/api/translate-and-broadcast', async (req: Request, res: Response) => 
       session.subtitles.shift();
     }
 
-    // 3. Broadcast to all student phones in near real-time
+    // 2. Broadcast subtitles immediately to all student phones so screens update with zero perceptible delay
     broadcastToStudents(session, {
       type: 'TRANSLATION_BROADCAST',
       subtitle: subtitleItem,
-      audioBase64, // Complete 24kHz WAV audio from Gemini TTS
+      audioBase64: null,
       isLive: session.isLive,
     });
 
-    // 4. Return to teacher
+    // 3. Return to teacher console immediately
     res.json({
       success: true,
       subtitle: subtitleItem,
-      audioAvailable: !!audioBase64,
       studentCount: session.students.size,
     });
+
+    // 4. Asynchronously synthesize Hindi audio and broadcast as soon as ready (with text fallback)
+    generateHindiAudio(hindiTranslation)
+      .then((audioBase64) => {
+        if (audioBase64) {
+          broadcastToStudents(session, {
+            type: 'AUDIO_CHUNK_BROADCAST',
+            subtitleId: subtitleItem.id,
+            audioBase64,
+            hindiText: hindiTranslation,
+            ttsSuccess: true,
+          });
+        } else {
+          console.warn('Hindi TTS audio generation returned null');
+          broadcastToStudents(session, {
+            type: 'AUDIO_CHUNK_BROADCAST',
+            subtitleId: subtitleItem.id,
+            audioBase64: null,
+            hindiText: hindiTranslation,
+            ttsSuccess: false,
+            ttsError: 'ध्वनि निर्माण में त्रुटि (Hindi TTS failed on server)',
+          });
+          notifyTeacher(session, {
+            type: 'TTS_WARNING',
+            subtitleId: subtitleItem.id,
+            message: 'Hindi speech audio could not be generated for this phrase.',
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn('Async Hindi TTS error:', err?.message || err);
+        broadcastToStudents(session, {
+          type: 'AUDIO_CHUNK_BROADCAST',
+          subtitleId: subtitleItem.id,
+          audioBase64: null,
+          hindiText: hindiTranslation,
+          ttsSuccess: false,
+          ttsError: err?.message || 'Hindi TTS error',
+        });
+        notifyTeacher(session, {
+          type: 'TTS_WARNING',
+          subtitleId: subtitleItem.id,
+          message: err?.message || 'Hindi TTS error',
+        });
+      });
   } catch (err: any) {
     console.error('Translation failed:', err);
     res.status(500).json({
@@ -342,6 +454,13 @@ app.get('/api/test-audio', async (req: Request, res: Response) => {
   try {
     const testHindi = 'नमस्ते! यह आर्ट ऑफ लिविंग लाइव ट्रांसलेटर है। आपकी ध्वनि सही तरीके से चल रही है।';
     const audioBase64 = await generateHindiAudio(testHindi);
+    if (!audioBase64) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to synthesize test Hindi audio',
+        text: testHindi,
+      });
+    }
     res.json({
       success: true,
       text: testHindi,
@@ -356,7 +475,8 @@ app.get('/api/test-audio', async (req: Request, res: Response) => {
 wss.on('connection', (ws: WebSocket, req) => {
   const url = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`);
   const role = url.searchParams.get('role') || 'student';
-  const sessionId = url.searchParams.get('sessionId') || 'AOL-DEFAULT';
+  const rawSessionId = url.searchParams.get('sessionId') || 'AOL-108';
+  const sessionId = rawSessionId.trim().toUpperCase();
   const studentId = url.searchParams.get('studentId') || `student-${Math.random().toString(36).substring(2, 8)}`;
   const studentName = url.searchParams.get('studentName') || `Student (${studentId.substring(8, 12).toUpperCase()})`;
 
@@ -456,7 +576,6 @@ wss.on('connection', (ws: WebSocket, req) => {
           if (text) {
             try {
               const hindiText = await translateEnglishToHindi(text, session.category);
-              const audioBase64 = await generateHindiAudio(hindiText);
 
               const sub: SubtitleItem = {
                 id: `sub-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -468,21 +587,66 @@ wss.on('connection', (ws: WebSocket, req) => {
               session.subtitles.push(sub);
               if (session.subtitles.length > 50) session.subtitles.shift();
 
-              // Broadcast to all students
+              // Broadcast subtitle immediately to all students
               broadcastToStudents(session, {
                 type: 'TRANSLATION_BROADCAST',
                 subtitle: sub,
-                audioBase64,
+                audioBase64: null,
                 isLive: session.isLive,
               });
 
-              // Confirm back to teacher
+              // Confirm back to teacher immediately
               ws.send(
                 JSON.stringify({
                   type: 'TRANSLATION_CONFIRMED',
                   subtitle: sub,
                 })
               );
+
+              // Asynchronously synthesize audio and stream to all students
+              generateHindiAudio(hindiText)
+                .then((audioBase64) => {
+                  if (audioBase64) {
+                    broadcastToStudents(session, {
+                      type: 'AUDIO_CHUNK_BROADCAST',
+                      subtitleId: sub.id,
+                      audioBase64,
+                      hindiText: hindiText,
+                      ttsSuccess: true,
+                    });
+                  } else {
+                    console.warn('Hindi TTS audio generation returned null in WS path');
+                    broadcastToStudents(session, {
+                      type: 'AUDIO_CHUNK_BROADCAST',
+                      subtitleId: sub.id,
+                      audioBase64: null,
+                      hindiText: hindiText,
+                      ttsSuccess: false,
+                      ttsError: 'ध्वनि निर्माण में त्रुटि (Hindi TTS failed on server)',
+                    });
+                    notifyTeacher(session, {
+                      type: 'TTS_WARNING',
+                      subtitleId: sub.id,
+                      message: 'Hindi speech audio could not be generated for this phrase.',
+                    });
+                  }
+                })
+                .catch((err) => {
+                  console.warn('Async Hindi TTS error in WS:', err?.message || err);
+                  broadcastToStudents(session, {
+                    type: 'AUDIO_CHUNK_BROADCAST',
+                    subtitleId: sub.id,
+                    audioBase64: null,
+                    hindiText: hindiText,
+                    ttsSuccess: false,
+                    ttsError: err?.message || 'Hindi TTS error',
+                  });
+                  notifyTeacher(session, {
+                    type: 'TTS_WARNING',
+                    subtitleId: sub.id,
+                    message: err?.message || 'Hindi TTS error',
+                  });
+                });
             } catch (err: any) {
               ws.send(
                 JSON.stringify({
@@ -511,16 +675,19 @@ wss.on('connection', (ws: WebSocket, req) => {
         });
       }
     } else {
-      session.students.delete(studentId);
-      notifyTeacher(session, {
-        type: 'STUDENTS_UPDATED',
-        studentCount: session.students.size,
-        students: getStudentList(session),
-      });
-      broadcastToStudents(session, {
-        type: 'STUDENT_COUNT_CHANGE',
-        studentCount: session.students.size,
-      });
+      const existingStudent = session.students.get(studentId);
+      if (existingStudent && existingStudent.ws === ws) {
+        session.students.delete(studentId);
+        notifyTeacher(session, {
+          type: 'STUDENTS_UPDATED',
+          studentCount: session.students.size,
+          students: getStudentList(session),
+        });
+        broadcastToStudents(session, {
+          type: 'STUDENT_COUNT_CHANGE',
+          studentCount: session.students.size,
+        });
+      }
     }
   });
 });

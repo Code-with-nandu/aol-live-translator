@@ -130,11 +130,21 @@ export class TeacherSpeechRecognizer {
       }
     }
 
+    // If audioStream was granted but SpeechRecognition is not supported on this browser:
+    if (this.audioStream) {
+      this.isListening = true;
+      this.callbacks.onStateChange?.(true);
+      return true;
+    }
+
     return false;
   }
 
+  private isRecordingAudio: boolean = false;
+
   private startAudioMeter(stream: MediaStream) {
     try {
+      this.isRecordingAudio = true;
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       this.audioCtx = new AudioContextClass();
       const source = this.audioCtx.createMediaStreamSource(stream);
@@ -145,7 +155,7 @@ export class TeacherSpeechRecognizer {
       const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
 
       const checkVolume = () => {
-        if (!this.analyser || !this.isListening) {
+        if (!this.analyser || !this.isRecordingAudio) {
           this.callbacks.onAudioLevel?.(0);
           return;
         }
@@ -156,8 +166,8 @@ export class TeacherSpeechRecognizer {
           sum += dataArray[i];
         }
         const average = sum / dataArray.length;
-        // Normalize 0 to 100
-        const level = Math.min(100, Math.round((average / 128) * 100));
+        // Normalize 0 to 100 with sensitivity scaling
+        const level = Math.min(100, Math.round((average / 110) * 100));
         this.callbacks.onAudioLevel?.(level);
 
         this.animFrameId = requestAnimationFrame(checkVolume);
@@ -171,6 +181,7 @@ export class TeacherSpeechRecognizer {
 
   public stop() {
     this.shouldRestart = false;
+    this.isRecordingAudio = false;
     if (this.recognition) {
       try {
         this.recognition.stop();
